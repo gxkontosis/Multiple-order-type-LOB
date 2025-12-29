@@ -1,9 +1,9 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.36717.8 d17.14
+VisualStudioVersion = 17.14.36717.8
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Test Harness", "Test Harness.vcxproj", "{37A2E7B5-F1C4-4D66-B87E-EB7B45B40382}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Multi-Order type LOB", "Multi-Order type LOB.vcxproj", "{37A2E7B5-F1C4-4D66-B87E-EB7B45B40382}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

@@ -1,15 +1,17 @@
 #include "OrderBook.h"
 
+ID Orderbook::nextOrderID = 0;
+
+// Description: Main entry point for processing orders, validates and 
+// routes to appropriate handler based on order type.
 OrderOutcome Orderbook::ExecuteTrade(Order& order)
 {
-   // Quick eligibility check (cheap)
    if ( !CanProcessOrder(order) )
    {
        completedOrders.Add(std::move(order));
        return OrderOutcome::Cancelled;
    }
 
-   // Dispatch based on order type
    switch (order.GetType())
    {
       case OrderType::Market:
@@ -29,6 +31,121 @@ OrderOutcome Orderbook::ExecuteTrade(Order& order)
    }
 }
 
+// Description: Modifies an existing resting order's price and volume, 
+// maintaining price-time priority on volume decrease.
+bool Orderbook::ModifyOrder(const ID orderID, const Price newPrice, const Volume newVolume)
+{
+   if (newVolume <= 0)
+   {
+      return CancelOrder(orderID);
+   }
+
+   auto refIt = orderbookReference.find(orderID);
+
+   if (refIt == orderbookReference.end())
+      return false;
+
+   const Price oldPrice = refIt->second.price;
+   const Side side = refIt->second.side;
+
+   if ( side == Side::Buy )
+   {
+      for (auto it = bids[oldPrice].begin(); it != bids[oldPrice].end(); ++it)
+      {
+         if ( it->GetId() == orderID )
+         {
+            ModifyVolume( *it, newVolume);
+         
+            if (oldPrice != newPrice)
+            {
+               bids[newPrice].push_back(std::move(*it));
+               (void)bids[oldPrice].erase(it);
+               refIt->second.price = newPrice;
+            }
+            break;
+         }
+      }
+   }
+   else
+   {
+      for (auto it = asks[oldPrice].begin(); it != asks[oldPrice].end(); ++it)
+      {
+         if ( it->GetId() == orderID )
+         {
+            ModifyVolume( *it, newVolume);
+         
+            if (oldPrice != newPrice)
+            {
+               asks[newPrice].push_back(std::move(*it));
+               (void)asks[oldPrice].erase(it);
+               refIt->second.price = newPrice;
+            }
+            break;
+         }
+      }
+   }
+
+   return true;
+}
+
+// Description: Updates an order's remaining volume, rejecting increases 
+// to maintain queue priority fairness.
+bool Orderbook::ModifyVolume(Order& order, const Volume newVolume)
+{
+   if (newVolume > order.GetRemainingVolume())
+   {
+      return false;
+   }
+
+   if (newVolume < order.GetRemainingVolume())
+   {
+      order.SetRemainingVolume(newVolume);
+      return true;
+   }
+
+   return true;
+}
+
+// Description: Removes an order from the orderbook and reference map.
+bool Orderbook::CancelOrder(const ID orderID)
+{
+   auto refIt = orderbookReference.find(orderID);
+
+   if (refIt == orderbookReference.end())
+      return false;
+
+   const Price price = refIt->second.price;
+   const Side side = refIt->second.side;
+
+   if ( side == Side::Buy )
+   {
+      for (auto it = bids[price].begin(); it != bids[price].end(); ++it)
+      {
+         if ( it->GetId() == orderID )
+         {
+            orderbookReference.erase(refIt);
+            (void)bids[price].erase(it);
+            break;
+         }
+      }
+   }
+   else
+   {
+      for (auto it = asks[price].begin(); it != asks[price].end(); ++it)
+      {
+         if ( it->GetId() == orderID )
+         {
+            orderbookReference.erase(refIt);
+            (void)asks[price].erase(it);
+            break;
+         }
+      }
+   }
+   return true;
+}
+
+// Description: Finalizes order processing by updating remaining volume 
+// and moving to completed orders list.
 OrderOutcome Orderbook::CleanupOrder(Order& order, const Volume accumulated, const Volume required)
 {
    if (accumulated >= required)
@@ -37,250 +154,234 @@ OrderOutcome Orderbook::CleanupOrder(Order& order, const Volume accumulated, con
    }
    else
    {
-      order.SetRemainingVolume(accumulated);
+      order.SetRemainingVolume(required - accumulated);
    }
 
    if (order.GetRemainingVolume() == 0)
    {
+      completedOrders.Add(std::move(order));
       return OrderOutcome::FullyFilled;
    }
    else
    {
+      completedOrders.Add(std::move(order));
       return OrderOutcome::PartiallyFilledAndCancelled;
    }
 }
 
-// Tidy up order, remove it from top of book, move to completed list.
+// Description: Removes fully filled order from queue, updates reference 
+// map, and adds to completed orders.
 void Orderbook::HandleFilledOrder(std::deque<Order>& queue)
 {
-   queue.front().SetRemainingVolume(0);
-   completedOrders.Add(std::move(queue.front()));
-   queue.pop_front();
+   Order order = std::move(queue.front());
+   orderbookReference.erase(order.GetId());
+
+   order.SetRemainingVolume(0);
+   completedOrders.Add(std::move(order));
+   queue.pop_front();   
 }
 
-OrderOutcome Orderbook::HandleMarketOrder( Order& order)
+// Description: Executes market order by consuming liquidity across all 
+// available price levels until filled or exhausted.
+OrderOutcome Orderbook::HandleMarketOrder(Order& order)
 {
-   Volume required = order.GetInitialVolume();
+   const Volume required = order.GetInitialVolume();
    Volume accumulated = 0;
-   Side orderSide = order.GetSide();
+   const Side orderSide = order.GetSide();
+   Volume remaining = 0;
    
    if (orderSide == Side::Buy)
    {
-      while (!asks.empty() && accumulated < required)
+      auto it = asks.begin();
+
+      while (!asks.empty() && accumulated < required) 
       {
-         auto it = asks.begin();
          auto& queue = it->second;
 
          while (!queue.empty() && accumulated < required) 
          {
-            Volume remaining = required - accumulated;
+            remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
+   
          if (queue.empty())
-            asks.erase(it);
+            it = asks.erase(it);
       }
    }
-   else  // Sell side
+   else
    {
+      auto it = bids.begin();
       while (!bids.empty() && accumulated < required)
       {
-         auto it = bids.begin();
          auto& queue = it->second;
 
          while (!queue.empty() && accumulated < required) 
          {
-            Volume remaining = required - accumulated;
+            remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
          if (queue.empty())
-            bids.erase(it);
+            it = bids.erase(it);
       }  
    }
    
    return CleanupOrder(order, accumulated, required);
 }
 
-// Same logic as market order, might want to change something here.
-OrderOutcome Orderbook::HandleFillOrKill( Order& order)
+// Description: Executes Fill-or-Kill order atomically after validation 
+// confirms sufficient volume exists.
+OrderOutcome Orderbook::HandleFillOrKill(Order& order)
 {
-   Volume required = order.GetInitialVolume();
-   Volume accumulated = 0;
-   Side orderSide = order.GetSide();
-   
-   if (orderSide == Side::Buy)
-   {
-      while (!asks.empty() && accumulated < required)
-      {
-         auto it = asks.begin();
-         auto& queue = it->second;
-
-         while (!queue.empty() && accumulated < required) 
-         {
-            Volume remaining = required - accumulated;
-            accumulated += ConsumeOrderbookEntry(remaining, queue);
-         }
-         if (queue.empty())
-            asks.erase(it);
-      }
-   }
-   else  // Sell side
-   {
-      while (!bids.empty() && accumulated < required)
-      {
-         auto it = bids.begin();
-         auto& queue = it->second;
-
-         while (!queue.empty() && accumulated < required) 
-         {
-            Volume remaining = required - accumulated;
-            accumulated += ConsumeOrderbookEntry(remaining, queue);
-         }
-         if (queue.empty())
-            bids.erase(it);
-      }  
-   }
-   
-   return CleanupOrder(order, accumulated, required);
+   return HandleMarketOrder(order);
 }
 
-OrderOutcome Orderbook::HandleIOC( Order& order)
+// Description: Executes Immediate-or-Cancel order up to the limit price,
+// cancelling any unfilled portion.
+OrderOutcome Orderbook::HandleIOC(Order& order)
 {
-   Volume required = order.GetInitialVolume();
+   const Volume required = order.GetInitialVolume();
    Volume accumulated = 0;
-   Price limit = order.GetPrice();
-   Side orderSide = order.GetSide();
+   const Price limit = order.GetPrice();
+   const Side orderSide = order.GetSide();
+   Volume remaining = 0;
 
    if (orderSide == Side::Buy)
    {
-      while (accumulated < required && !asks.empty() && limit >= asks.begin()->first)
-      {
-         auto it = asks.begin();
+      auto it = asks.begin();
+
+      while (accumulated < required && !asks.empty() && limit >= it->first)
+      {         
          auto& queue = it->second;
 
          while (accumulated < required && !queue.empty()) 
          {
-            Volume remaining = required - accumulated;
+            remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
-         if (queue.empty())
-            asks.erase(it);
+         if ( queue.empty() )
+            it = asks.erase(it);
       }
    }
-   else  // Sell side
+   else
    {
-      while (accumulated < required && !bids.empty() && limit <= bids.begin()->first)
-      {
-         auto it = bids.begin();
+      auto it = bids.begin();
+
+      while (accumulated < required && !bids.empty() && limit <= it->first)
+      {         
          auto& queue = it->second;
 
          while (accumulated < required && !queue.empty()) 
          {
-            Volume remaining = required - accumulated;
+            remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
-         if (queue.empty())
-            bids.erase(it);
+         if ( queue.empty() )
+            it = bids.erase(it);
       }  
-   }
-   
+   }   
    return CleanupOrder(order, accumulated, required);
 }
 
-OrderOutcome Orderbook::HandleLimitOrder( Order& order)
+// Description: Executes limit order, immediately filling at available 
+// prices or adding remainder to book at specified price.
+OrderOutcome Orderbook::HandleLimitOrder(Order& order)
 {
-   Volume required = order.GetInitialVolume();
+   const Volume required = order.GetInitialVolume();
    Volume accumulated = 0;
-   Price limit = order.GetPrice();
-   Side orderSide = order.GetSide();
+   const Price limit = order.GetPrice();
+   const Side orderSide = order.GetSide();
 
-   // If price requested cannot be filled immediately, add to book.
-   if ( orderSide == Side::Buy && (asks.empty() || limit < asks.begin()->first) )
+   if (orderSide == Side::Buy && (asks.empty() || limit < asks.begin()->first))
    {
-      bids[limit].push_back(order);
+      orderbookReference[order.GetId()] = {limit, orderSide};
+      bids[limit].push_back(std::move(order));
       return OrderOutcome::AddedToOrderbook;
    }
-   else if ( orderSide == Side::Sell && (bids.empty() || limit > bids.begin()->first) )
+   else if (orderSide == Side::Sell && (bids.empty() || limit > bids.begin()->first))
    {
-      asks[limit].push_back(order);
+      orderbookReference[order.GetId()] = {limit, orderSide};
+      asks[limit].push_back(std::move(order));
       return OrderOutcome::AddedToOrderbook;
    }
 
-   //Order can Be filled.
    if (orderSide == Side::Buy)
    {
-      while (accumulated < required && !asks.empty() && limit >= asks.begin()->first)
+      auto it = asks.begin();
+
+      while (accumulated < required && !asks.empty() && limit >= it->first)
       {
-         auto it = asks.begin();
          auto& queue = it->second;
 
          while (accumulated < required && !queue.empty()) 
          {
-            Volume remaining = required - accumulated;
+            const Volume remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
          if (queue.empty())
-            asks.erase(it);
+           it = asks.erase(it);
       }
    }
-   else  // Sell side
+   else
    {
-      while (accumulated < required && !bids.empty() && limit <= bids.begin()->first)
-      {
-         auto it = bids.begin();
+      auto it = bids.begin();
+
+      while (accumulated < required && !bids.empty() && limit <= it->first)
+      {         
          auto& queue = it->second;
 
          while (accumulated < required && !queue.empty()) 
          {
-            Volume remaining = required - accumulated;
+            const Volume remaining = required - accumulated;
             accumulated += ConsumeOrderbookEntry(remaining, queue);
          }
          if (queue.empty())
-            bids.erase(it);
+            it = bids.erase(it);
       }
    }
    
    if (accumulated < required)
    {
-      // Add unfilled portion to book
-      Order partialOrder = order;
-      partialOrder.SetRemainingVolume(required - accumulated);
-      if (orderSide == Side::Buy)
-         bids[limit].push_back(partialOrder);
+      order.SetRemainingVolume(required - accumulated);
+      orderbookReference[order.GetId()] = {limit, orderSide};
+
+      if (orderSide == Side::Buy)      
+         bids[limit].push_back(std::move(order));
       else
-         asks[limit].push_back(partialOrder);
+         asks[limit].push_back(std::move(order));
       return OrderOutcome::PartiallyFilledAndAddedToBook;
    }
    
+   completedOrders.Add(std::move(order));
    return OrderOutcome::FullyFilled;
 }
 
-Volume Orderbook::ConsumeOrderbookEntry(const Volume remaining, std::deque<Order>& queue)
+// Description: Matches incoming order against top-of-book resting 
+// order, consuming available volume.
+Volume Orderbook::ConsumeOrderbookEntry(const Volume toBeFilledVolume, std::deque<Order>& queue)
 {
    Order& topOfBook = queue.front();
-   Volume remainingVolume = topOfBook.GetRemainingVolume();
+   const Volume topOfBookVolume = topOfBook.GetRemainingVolume();
 
-   // If the order volume is less than what is required, fill the whole order and remove it from queue
-   if (remaining >= remainingVolume)
+   if (toBeFilledVolume >= topOfBookVolume)
    {
       HandleFilledOrder(queue);
-      return remainingVolume;
+      return topOfBookVolume;
    }
    else
    {
-      Volume leftOver = remainingVolume - remaining;
+      const Volume leftOver = topOfBookVolume - toBeFilledVolume;
       topOfBook.SetRemainingVolume(leftOver);
-      return remaining;
+      return toBeFilledVolume;
    }
 }
 
-// Checks if all conditions to execute each order are fulfilled.
+// Description: Validates order eligibility by checking volume, 
+// available liquidity, and order-type-specific requirements.
 bool Orderbook::CanProcessOrder(const Order& order) const
 {
-   // Reject invalid quantities
-   if (order.GetInitialQuantity() <= 0)
+   if (order.GetInitialVolume() <= 0)
        return false;
 
-   // Market order cannot execute if opposite side is empty
    if (order.GetType() == OrderType::Market)
    {
       if ((order.GetSide() == Side::Buy && asks.empty()) ||
@@ -288,10 +389,8 @@ bool Orderbook::CanProcessOrder(const Order& order) const
       {
           return false;
       }
-      return true;
    }
 
-   // FOK requires sufficient volume
    if (order.GetType() == OrderType::FillOrKill)
    {
        if (order.GetSide() == Side::Buy)
@@ -300,76 +399,73 @@ bool Orderbook::CanProcessOrder(const Order& order) const
            return HasSufficientVolume(order, bids);
    }
 
-   //Reject IOC if requested price is beyond what is offered.
    if (order.GetType() == OrderType::ImmediateOrCancel)
    {
       if (order.GetSide() == Side::Buy)
       {
-         if (!asks.empty() && order.GetPrice() > asks.begin()->first)
+         if (!asks.empty() && order.GetPrice() < asks.begin()->first)
             return false;
       }
-      else // Sell
+      else
       {
-         if (!bids.empty() && order.GetPrice() < bids.begin()->first)
+         if (!bids.empty() && order.GetPrice() > bids.begin()->first)
              return false;
       }
-      return true;
    }
 
-   // Limit orders are always valid to process
    return true;
 }
 
-// For asks (normal map)
+// Description: Overload for asks map to check if sufficient
+// volume exists for Fill-or-Kill buy orders.
 bool Orderbook::HasSufficientVolume(const Order& order,
                                     const std::map<double, std::deque<Order>>& bookSide) const
 {
    return HasSufficientBuyVolume(order, bookSide);
 }
 
-// For bids (reverse map)
+// Description: Overload for bids map to check if sufficient volume exists for Fill-or-Kill sell orders.
 bool Orderbook::HasSufficientVolume(const Order& order,
                                     const std::map<double, std::deque<Order>, std::greater<double>>& bookSide) const
 {
    return HasSufficientSellVolume(order, bookSide);
 }
 
+// Description: Calculates total available volume in asks up to 
+// limit price for Fill-or-Kill validation.
 bool Orderbook::HasSufficientBuyVolume(
    const Order& order,
    const std::map<double, std::deque<Order>>& asks) const
 {
-   Volume required = order.GetInitialVolume();
+   const Volume required = order.GetInitialVolume();
    Volume accumulated = 0;
-   Price limit = order.GetPrice();
+   const Price limit = order.GetPrice();
 
    for (auto it = asks.begin(); it != asks.end(); ++it)
    {
-      // Stop if price exceeds our limit
       if (it->first > limit)
          break;
 
-      // Sum volume at this level
       for (const auto& restingOrder : it->second)
          accumulated += restingOrder.GetRemainingVolume();
 
       if (accumulated >= required)
          return true;
    }
-
    return false;
 }
 
+// Description: Calculates total available volume in bids down to limit price for Fill-or-Kill validation.
 bool Orderbook::HasSufficientSellVolume(
    const Order& order,
    const std::map<double, std::deque<Order>, std::greater<double>>& bids) const
 {
-   Volume required = order.GetInitialVolume();
+   const Volume required = order.GetInitialVolume();
    Volume accumulated = 0;
-   Price limit = order.GetPrice();
+   const Price limit = order.GetPrice();
 
    for (auto it = bids.begin(); it != bids.end(); ++it)
    {
-      // Stop if price is below our limit
       if (it->first < limit)
          break;
 
@@ -379,6 +475,5 @@ bool Orderbook::HasSufficientSellVolume(
       if (accumulated >= required)
          return true;
    }
-
    return false;
 }

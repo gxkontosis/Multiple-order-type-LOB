@@ -3,23 +3,34 @@
 
 #include <map>
 #include <deque>
+#include <unordered_map>
+#include <iostream>
 
-#include "OrderType.h"
+#include "CompletedOrders.h"
 
 class Orderbook
 {
 public:
 
    OrderOutcome ExecuteTrade(Order& order);
+   ID GetNextOrderId() { return ++nextOrderID; }  // Helper to generate IDs
    
+   bool ModifyOrder(ID orderID, Price newPrice, Volume newVolume);
+   bool ModifyVolume(Order& order, Volume newVolume);
+   bool CancelOrder(ID orderID);
+
    // I also want to add: current level - price last trade took place at and remaining cash on that level
    // Modify/Cancel order
    // Order history.
    // Unit tests.
 
 private:
-   std::map<double, std::deque<Order>> asks;
-   std::map<double, std::deque<Order>, std::greater<double>> bids;
+   static ID nextOrderID;
+   
+   std::map<Price, std::deque<Order>> asks;
+   std::map<Price, std::deque<Order>, std::greater<Price>> bids;
+   std::unordered_map<ID, OrderLocation> orderbookReference;
+
    CompletedOrders completedOrders;
 
    Volume ConsumeOrderbookEntry(const Volume remaining, std::deque<Order>& queue);
